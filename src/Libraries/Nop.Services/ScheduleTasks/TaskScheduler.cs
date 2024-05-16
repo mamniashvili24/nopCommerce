@@ -20,6 +20,7 @@ public partial class TaskScheduler : ITaskScheduler
     protected static readonly List<TaskThread> _taskThreads = new();
     protected readonly AppSettings _appSettings;
     private readonly IServiceScopeFactory _serviceScopeFactory;
+    private Task _taskThread;
 
     #endregion
 
@@ -114,17 +115,22 @@ public partial class TaskScheduler : ITaskScheduler
     /// </summary>
     public void StartScheduler()
     {
-        foreach (var taskThread in _taskThreads)
-            taskThread.InitTimer();
+        _taskThread = Task.WhenAll(_taskThreads.Select(taskThread => taskThread.InitTimerAsync()));
     }
 
     /// <summary>
     /// Stops the task scheduler
     /// </summary>
-    public void StopScheduler()
+    public async Task StopSchedulerAsync()
     {
         foreach (var taskThread in _taskThreads)
             taskThread.Dispose();
+
+        if (_taskThread is { IsCompleted: false })
+            await _taskThread;
+
+        _taskThread?.Dispose();
+        _taskThreads.Clear();
     }
 
     #endregion
@@ -141,12 +147,8 @@ public partial class TaskScheduler : ITaskScheduler
         protected readonly string _scheduleTaskUrl;
         protected readonly ScheduleTask _scheduleTask;
         protected readonly int? _timeout;
-
-        protected Timer _timer;
         protected bool _disposed;
-
-        internal static IHttpClientFactory HttpClientFactory { get; set; }
-        internal static IServiceScopeFactory ServiceScopeFactory { get; set; }
+        protected readonly CancellationTokenSource _cancellationToken;
 
         #endregion
 
@@ -157,7 +159,9 @@ public partial class TaskScheduler : ITaskScheduler
             _scheduleTaskUrl = scheduleTaskUrl;
             _scheduleTask = task;
             _timeout = timeout;
-
+            IsStarted = false;
+            _cancellationToken = new CancellationTokenSource();
+            
             Seconds = 10 * 60;
         }
 
@@ -213,35 +217,7 @@ public partial class TaskScheduler : ITaskScheduler
 
             IsRunning = false;
         }
-
-        /// <summary>
-        /// Method that handles calls from a <see cref="T:System.Threading.Timer" />
-        /// </summary>
-        /// <param name="state">An object containing application-specific information relevant to the method invoked by this delegate</param>
-        protected void TimerHandler(object state)
-        {
-            try
-            {
-                _timer.Change(Timeout.Infinite, Timeout.Infinite);
-
-                RunAsync().Wait();
-            }
-            catch
-            {
-                // ignore
-            }
-            finally
-            {
-                if (!_disposed && _timer != null)
-                {
-                    if (RunOnlyOnce)
-                        Dispose();
-                    else
-                        _timer.Change(Interval, Interval);
-                }
-            }
-        }
-
+        
         /// <summary>
         /// Protected implementation of Dispose pattern.
         /// </summary>
@@ -251,11 +227,9 @@ public partial class TaskScheduler : ITaskScheduler
             if (_disposed)
                 return;
 
-            if (disposing)
-                lock (this)
-                    _timer?.Dispose();
-
+            IsStarted = false;
             _disposed = true;
+            _cancellationToken.Cancel();
         }
 
         #endregion
@@ -274,14 +248,43 @@ public partial class TaskScheduler : ITaskScheduler
         /// <summary>
         /// Inits a timer
         /// </summary>
-        public void InitTimer()
+        public async Task InitTimerAsync()
         {
-            _timer ??= new Timer(TimerHandler, null, InitInterval, Interval);
+            var interval = TimeSpan.FromMilliseconds(Interval);
+            IsStarted = true;
+            using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(InitInterval > 0 ? InitInterval : 1));
+            
+            while (await timer.WaitForNextTickAsync(_cancellationToken.Token))
+            {
+                if (IsDisposed)
+                    break;
+
+                try
+                {
+                    await RunAsync();
+                }
+                catch
+                {
+                    // ignore
+                }
+                finally
+                {
+                    if (!IsDisposed && RunOnlyOnce) 
+                        Dispose();
+                }
+
+                if (timer.Period != interval)
+                    timer.Period = interval;
+            }
         }
 
         #endregion
 
         #region Properties
+
+        internal static IHttpClientFactory HttpClientFactory { get; set; }
+
+        internal static IServiceScopeFactory ServiceScopeFactory { get; set; }
 
         /// <summary>
         /// Gets or sets the interval in seconds at which to run the tasks
@@ -341,7 +344,7 @@ public partial class TaskScheduler : ITaskScheduler
         /// <summary>
         /// Gets a value indicating whether the timer is started
         /// </summary>
-        public bool IsStarted => _timer != null;
+        public bool IsStarted { get; set; }
 
         /// <summary>
         /// Gets a value indicating whether the timer is disposed

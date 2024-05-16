@@ -18,5 +18,5 @@ public partial interface ITaskScheduler
     /// <summary>
     /// Stops the task scheduler
     /// </summary>
-    public void StopScheduler();
+    public Task StopSchedulerAsync();
 }
